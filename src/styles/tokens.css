@@ -1,0 +1,48 @@
+:root {
+  /* Surfaces */
+  --bg: #080810;
+  --bg-raised: #0d0d1a;
+  --bg-overlay: #121224;
+  --bg-high: #181830;
+
+  /* Borders */
+  --border: rgba(255, 255, 255, 0.06);
+  --border-hover: rgba(255, 255, 255, 0.12);
+  --border-focus: rgba(99, 102, 241, 0.6);
+  --border-strong: rgba(255, 255, 255, 0.18);
+  --border-h: var(--border-hover);
+
+  /* Radius */
+  --r-sm: 6px;
+  --r: 10px;
+  --r-lg: 14px;
+  --r-xl: 20px;
+  --r-2xl: 28px;
+
+  /* Text */
+  --t1: #f0f0ff;
+  --t2: rgba(240, 240, 255, 0.55);
+  --t3: rgba(240, 240, 255, 0.28);
+  --t4: rgba(240, 240, 255, 0.14);
+
+  /* Accent */
+  --accent: #6366f1;
+  --accent-hover: #5558e8;
+  --accent-soft: rgba(99, 102, 241, 0.12);
+  --accent-dim: rgba(99, 102, 241, 0.06);
+  --accent-glow: rgba(99, 102, 241, 0.24);
+
+  /* Status */
+  --success: #22c55e;
+  --success-soft: rgba(34, 197, 94, 0.10);
+  --warning: #f59e0b;
+  --warning-soft: rgba(245, 158, 11, 0.10);
+  --error: #ef4444;
+  --error-soft: rgba(239, 68, 68, 0.10);
+
+  /* Shadows */
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.3), 0 1px 2px rgba(0, 0, 0, 0.2);
+  --shadow-md: 0 4px 20px rgba(0, 0, 0, 0.4), 0 2px 8px rgba(0, 0, 0, 0.2);
+  --shadow-lg: 0 16px 48px rgba(0, 0, 0, 0.5), 0 4px 16px rgba(0, 0, 0, 0.3);
+  --shadow-accent: 0 8px 32px rgba(99, 102, 241, 0.2);
+}
