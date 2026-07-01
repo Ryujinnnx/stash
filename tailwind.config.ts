@@ -1,0 +1,80 @@
+import type { Config } from "tailwindcss";
+
+const config = {
+  content: ["./index.html", "./src/**/*.{ts,tsx}"],
+  theme: {
+    extend: {
+      fontFamily: {
+        display: ["Instrument Sans", "sans-serif"],
+        body: ["DM Sans", "sans-serif"],
+        mono: ["DM Mono", "monospace"],
+        ui: ["DM Sans", "sans-serif"],
+      },
+      fontSize: {
+        "2xs": ["10px", { lineHeight: "16px", letterSpacing: "0.08em" }],
+        xs: ["12px", { lineHeight: "18px" }],
+        sm: ["13px", { lineHeight: "20px" }],
+        base: ["15px", { lineHeight: "24px" }],
+        lg: ["17px", { lineHeight: "28px" }],
+        xl: ["22px", { lineHeight: "30px", letterSpacing: "-0.02em" }],
+        "2xl": ["28px", { lineHeight: "36px", letterSpacing: "-0.025em" }],
+        "3xl": ["36px", { lineHeight: "44px", letterSpacing: "-0.03em" }],
+        "4xl": ["clamp(40px,6vw,64px)", { lineHeight: "1.05", letterSpacing: "-0.035em" }],
+        "5xl": ["clamp(52px,9vw,96px)", { lineHeight: "1.0", letterSpacing: "-0.04em" }],
+      },
+      borderRadius: {
+        sm: "6px",
+        DEFAULT: "10px",
+        lg: "14px",
+        xl: "20px",
+        "2xl": "28px",
+        full: "9999px",
+        panel: "10px",
+      },
+      colors: {
+        bg: "var(--bg)",
+        raised: "var(--bg-raised)",
+        overlay: "var(--bg-overlay)",
+        high: "var(--bg-high)",
+        accent: "var(--accent)",
+        t1: "var(--t1)",
+        t2: "var(--t2)",
+        t3: "var(--t3)",
+        t4: "var(--t4)",
+        success: "var(--success)",
+        warning: "var(--warning)",
+        error: "var(--error)",
+        stash: {
+          base: "var(--bg)",
+          panel: "var(--bg-raised)",
+          raised: "var(--bg-overlay)",
+          line: "var(--border)",
+          muted: "var(--t2)",
+          text: "var(--t1)",
+          indigo: "var(--accent)",
+          violet: "var(--accent-hover)",
+          cyan: "#22d3ee",
+          success: "var(--success)",
+          warning: "var(--warning)",
+          danger: "var(--error)",
+        },
+      },
+      boxShadow: {
+        sm: "var(--shadow-sm)",
+        md: "var(--shadow-md)",
+        lg: "var(--shadow-lg)",
+        panel: "var(--shadow-md)",
+        indigo: "var(--shadow-accent)",
+        accent: "var(--shadow-accent)",
+      },
+      transitionTimingFunction: {
+        quart: "cubic-bezier(0.16, 1, 0.3, 1)",
+        quint: "cubic-bezier(0.16, 1, 0.3, 1)",
+        expo: "cubic-bezier(0.16, 1, 0.3, 1)",
+      },
+    },
+  },
+  plugins: [],
+} satisfies Config;
+
+export default config;
