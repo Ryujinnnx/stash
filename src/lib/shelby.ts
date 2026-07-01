@@ -22,12 +22,14 @@ export interface DatasetMetadata {
 
 export type ShelbyStorageErrorCode =
   | "ACCESS_DENIED"
+  | "ABORTED"
   | "CONFIGURATION_ERROR"
   | "CRYPTO_ERROR"
   | "DOWNLOAD_TIMEOUT"
   | "METADATA_NOT_FOUND"
   | "NETWORK_ERROR"
   | "UPLOAD_FAILED"
+  | "USER_REJECTED"
   | "VALIDATION_ERROR";
 
 export class ShelbyStorageError extends Error {
@@ -79,6 +81,7 @@ export interface ShelbyStorageContext {
   uploadTtlDays?: number;
   maxUploadRetries?: number;
   downloadTimeoutMs?: number;
+  abortSignal?: AbortSignal;
   verifyAccessProof?: (storageId: string, accessProof: string) => Promise<boolean>;
   onProgress?: (progress: UploadProgress) => void;
 }
@@ -159,56 +162,60 @@ export async function uploadFile(file: File, metadata: DatasetMetadata): Promise
 
   reportProgress(context, "validating", 5, "Validating dataset metadata");
   validateMetadata(normalizedMetadata);
+  throwIfAborted(context);
 
-  return withRetry(
-    async () => {
-      if (!context.buyerPublicKey) {
-        throw new ShelbyStorageError("CONFIGURATION_ERROR", "A buyer public encryption key is required for upload");
-      }
+  if (!context.buyerPublicKey) {
+    throw new ShelbyStorageError("CONFIGURATION_ERROR", "A buyer public encryption key is required for upload");
+  }
 
-      reportProgress(context, "encrypting", 15, "Encrypting dataset payload");
-      const encryptedFile = await encryptFile(file, context.buyerPublicKey);
-      const fileBlobName = createBlobName("files", file.name);
-      const manifestBlobName = createBlobName("metadata", `${file.name}.json`);
+  try {
+    reportProgress(context, "encrypting", 15, "Encrypting dataset payload");
+    const encryptedFile = await encryptFile(file, context.buyerPublicKey);
+    throwIfAborted(context);
 
-      reportProgress(context, "registering", 35, "Registering encrypted dataset blob");
-      await registerAndUploadBlob(client, context, fileBlobName, encryptedFile.bytes);
+    const fileBlobName = createBlobName("files", file.name);
+    const manifestBlobName = createBlobName("metadata", `${file.name}.json`);
 
-      const manifest: StashStorageManifest = {
-        version: 1,
-        kind: "stash.dataset.manifest",
-        metadata: normalizedMetadata,
-        file: {
-          blob_name: fileBlobName,
-          original_name: file.name,
-          mime_type: file.type || "application/octet-stream",
-          plain_size: file.size,
-          encrypted_size: encryptedFile.bytes.byteLength,
-          cipher: "AES-GCM",
-          iv: encryptedFile.iv,
-        },
-        key_envelope: {
-          algorithm: "RSA-OAEP-256",
-          encrypted_key: encryptedFile.encryptedKey,
-        },
-        created_at: normalizedMetadata.created_at,
-      };
+    reportProgress(context, "registering", 35, "Registering encrypted dataset blob");
+    await registerAndUploadBlob(client, context, fileBlobName, encryptedFile.bytes);
 
-      reportProgress(context, "metadata", 82, "Uploading encrypted dataset manifest");
-      await registerAndUploadBlob(client, context, manifestBlobName, encodeJson(manifest));
+    const manifest: StashStorageManifest = {
+      version: 1,
+      kind: "stash.dataset.manifest",
+      metadata: normalizedMetadata,
+      file: {
+        blob_name: fileBlobName,
+        original_name: file.name,
+        mime_type: file.type || "application/octet-stream",
+        plain_size: file.size,
+        encrypted_size: encryptedFile.bytes.byteLength,
+        cipher: "AES-GCM",
+        iv: encryptedFile.iv,
+      },
+      key_envelope: {
+        algorithm: "RSA-OAEP-256",
+        encrypted_key: encryptedFile.encryptedKey,
+      },
+      created_at: normalizedMetadata.created_at,
+    };
 
-      const storageId = encodeStorageId({
-        version: 1,
-        owner: accountAddress,
-        manifestBlobName,
-      });
-      reportProgress(context, "complete", 100, "Dataset stored on Shelby");
+    reportProgress(context, "metadata", 82, "Uploading encrypted dataset manifest");
+    await registerAndUploadBlob(client, context, manifestBlobName, encodeJson(manifest));
 
-      return storageId;
-    },
-    context.maxUploadRetries ?? DEFAULT_MAX_UPLOAD_RETRIES,
-    "UPLOAD_FAILED",
-  );
+    const storageId = encodeStorageId({
+      version: 1,
+      owner: accountAddress,
+      manifestBlobName,
+    });
+    reportProgress(context, "complete", 100, "Dataset stored on Shelby");
+
+    return storageId;
+  } catch (error) {
+    if (error instanceof ShelbyStorageError) {
+      throw error;
+    }
+    throw new ShelbyStorageError("UPLOAD_FAILED", "Shelby upload failed", error);
+  }
 }
 
 export async function downloadFile(storageId: string, accessProof: string): Promise<Blob> {
@@ -264,7 +271,10 @@ async function registerAndUploadBlob(
   blobName: string,
   blobData: ByteArray,
 ): Promise<void> {
+  throwIfAborted(context);
   const commitments = await generateBlobCommitments(blobData);
+  throwIfAborted(context);
+
   const accountAddress = requireAccountAddress(context);
   const signAndSubmitTransaction = requireSignAndSubmitTransaction(context);
   const erasureConfig = defaultErasureCodingConfig();
@@ -286,13 +296,21 @@ async function registerAndUploadBlob(
   reportProgress(context, "registering", 48, "Open Petra to register the Shelby blob");
   let submitted: { hash: string };
   try {
+    throwIfAborted(context);
     submitted = await signAndSubmitTransaction({ data: payload });
   } catch (error) {
+    if (isAbortError(error, context)) {
+      throw createAbortError(error);
+    }
+    if (isWalletRejectionError(error)) {
+      throw new ShelbyStorageError("USER_REJECTED", "Wallet request was rejected. Shelby upload was stopped.", error);
+    }
     throw new ShelbyStorageError("UPLOAD_FAILED", "Wallet failed before signing the Shelby blob registration", error);
   }
 
   reportProgress(context, "registering", 56, "Confirming Shelby blob registration on-chain");
   try {
+    throwIfAborted(context);
     await (context.aptos ?? createAptosClient(context)).waitForTransaction({
       transactionHash: submitted.hash,
     });
@@ -301,15 +319,23 @@ async function registerAndUploadBlob(
   }
 
   reportProgress(context, "uploading", 65, `Uploading ${blobName} to Shelby RPC`);
-  try {
-    await client.rpc.putBlob({
-      account: accountAddress,
-      blobName,
-      blobData,
-    });
-  } catch (error) {
-    throw new ShelbyStorageError("UPLOAD_FAILED", "Shelby RPC rejected the encrypted blob upload", error);
-  }
+  await withRetry(
+    async () => {
+      throwIfAborted(context);
+      try {
+        await client.rpc.putBlob({
+          account: accountAddress,
+          blobName,
+          blobData,
+        });
+      } catch (error) {
+        throw createShelbyRpcUploadError(error);
+      }
+    },
+    context.maxUploadRetries ?? DEFAULT_MAX_UPLOAD_RETRIES,
+    "UPLOAD_FAILED",
+    context,
+  );
 }
 
 async function generateBlobCommitments(blobData: ByteArray): Promise<BlobCommitments> {
@@ -604,26 +630,121 @@ async function withRetry<T>(
   operation: () => Promise<T>,
   retries: number,
   code: ShelbyStorageErrorCode,
+  context?: ShelbyStorageContext,
 ): Promise<T> {
   let attempt = 0;
   let lastError: unknown;
 
   while (attempt <= retries) {
     try {
+      if (context) {
+        throwIfAborted(context);
+      }
       return await operation();
     } catch (error) {
       lastError = error;
-      if (error instanceof ShelbyStorageError && error.code === "VALIDATION_ERROR") {
+      if (isNonRetryableError(error)) {
         throw error;
       }
       attempt += 1;
       if (attempt <= retries) {
-        await delay(2 ** attempt * 500);
+        await delay(2 ** attempt * 500, context?.abortSignal);
       }
     }
   }
 
   throw new ShelbyStorageError(code, describeRetriedFailure(code, lastError), lastError);
+}
+
+function throwIfAborted(context: ShelbyStorageContext): void {
+  if (context.abortSignal?.aborted) {
+    throw createAbortError(context.abortSignal.reason);
+  }
+}
+
+function createAbortError(cause?: unknown): ShelbyStorageError {
+  return new ShelbyStorageError("ABORTED", "Shelby upload was cancelled.", cause);
+}
+
+function createShelbyRpcUploadError(error: unknown): ShelbyStorageError {
+  const status = getHttpStatus(error);
+  const detail = getNestedErrorMessage(error);
+  const reason = status ? `Shelby RPC returned HTTP ${status}` : "Shelby RPC rejected the encrypted blob upload";
+  const message = detail && !detail.includes(reason) ? `${reason}: ${detail}` : reason;
+  return new ShelbyStorageError(status && status >= 500 ? "NETWORK_ERROR" : "UPLOAD_FAILED", message, error);
+}
+
+function isNonRetryableError(error: unknown): boolean {
+  if (isWalletRejectionError(error)) {
+    return true;
+  }
+
+  const status = getHttpStatus(error);
+  if (status !== null && status < 500) {
+    return true;
+  }
+
+  if (error instanceof ShelbyStorageError) {
+    return [
+      "ACCESS_DENIED",
+      "ABORTED",
+      "CONFIGURATION_ERROR",
+      "CRYPTO_ERROR",
+      "METADATA_NOT_FOUND",
+      "USER_REJECTED",
+      "VALIDATION_ERROR",
+    ].includes(error.code);
+  }
+
+  return false;
+}
+
+function isWalletRejectionError(error: unknown): boolean {
+  const message = getNestedErrorMessage(error)?.toLowerCase() ?? "";
+  return [
+    "user rejected",
+    "rejected",
+    "denied",
+    "declined",
+    "cancelled",
+    "canceled",
+    "user cancel",
+    "approval denied",
+  ].some((pattern) => message.includes(pattern));
+}
+
+function isAbortError(error: unknown, context: ShelbyStorageContext): boolean {
+  return context.abortSignal?.aborted === true || (error instanceof DOMException && error.name === "AbortError");
+}
+
+function getHttpStatus(error: unknown): number | null {
+  const message = getNestedErrorMessage(error);
+  if (message) {
+    const match = message.match(/\b([45]\d{2})\b/);
+    if (match?.[1]) {
+      return Number(match[1]);
+    }
+  }
+
+  if (typeof error !== "object" || error === null) {
+    return null;
+  }
+
+  const record = error as Record<string, unknown>;
+  const directStatus = record.status ?? record.statusCode;
+  if (typeof directStatus === "number") {
+    return directStatus;
+  }
+  if (typeof directStatus === "string" && /^\d+$/.test(directStatus)) {
+    return Number(directStatus);
+  }
+
+  const response = record.response;
+  if (typeof response === "object" && response !== null) {
+    return getHttpStatus(response);
+  }
+
+  return null;
 }
 
 function describeRetriedFailure(code: ShelbyStorageErrorCode, error: unknown): string {
@@ -650,9 +771,24 @@ function getNestedErrorMessage(error: unknown): string | null {
   return null;
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    window.setTimeout(resolve, ms);
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(createAbortError(signal.reason));
+      return;
+    }
+
+    const timeout = window.setTimeout(() => {
+      signal?.removeEventListener("abort", handleAbort);
+      resolve();
+    }, ms);
+
+    function handleAbort() {
+      window.clearTimeout(timeout);
+      reject(createAbortError(signal?.reason));
+    }
+
+    signal?.addEventListener("abort", handleAbort, { once: true });
   });
 }
 

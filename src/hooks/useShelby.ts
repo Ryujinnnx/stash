@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useWallet } from "@aptos-labs/wallet-adapter-react";
 import { resolveAccountAddress } from "../lib/wallet";
@@ -25,6 +25,7 @@ export interface UseUploadResult {
   storageId: string | null;
   error: ShelbyStorageError | null;
   isUploading: boolean;
+  cancel: () => void;
   reset: () => void;
 }
 
@@ -44,6 +45,7 @@ const IDLE_PROGRESS: UploadProgress = {
 
 export function useUpload(): UseUploadResult {
   const wallet = useWallet();
+  const abortController = useRef<AbortController | null>(null);
   const [progress, setProgress] = useState<UploadProgress>(IDLE_PROGRESS);
 
   const mutation = useMutation<string, ShelbyStorageError, UploadInput>({
@@ -53,17 +55,33 @@ export function useUpload(): UseUploadResult {
         throw createHookError("CONFIGURATION_ERROR", "Connect an Aptos wallet before uploading to Shelby");
       }
 
+      abortController.current?.abort();
+      const currentAbortController = new AbortController();
+      abortController.current = currentAbortController;
+
       configureShelbyStorage({
         accountAddress,
         signAndSubmitTransaction: wallet.signAndSubmitTransaction as SignAndSubmitTransaction,
         buyerPublicKey,
+        abortSignal: currentAbortController.signal,
         onProgress: setProgress,
       });
 
-      return uploadFile(file, metadata);
+      try {
+        return await uploadFile(file, metadata);
+      } finally {
+        if (abortController.current === currentAbortController) {
+          abortController.current = null;
+        }
+      }
     },
-    retry: 2,
+    retry: false,
   });
+
+  function cancel() {
+    abortController.current?.abort();
+    abortController.current = null;
+  }
 
   return {
     upload: mutation.mutateAsync,
@@ -71,7 +89,9 @@ export function useUpload(): UseUploadResult {
     storageId: mutation.data ?? null,
     error: mutation.error ?? null,
     isUploading: mutation.isPending,
+    cancel,
     reset: () => {
+      cancel();
       setProgress(IDLE_PROGRESS);
       mutation.reset();
     },
