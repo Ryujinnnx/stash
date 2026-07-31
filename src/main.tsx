@@ -1,4 +1,3 @@
-import "./polyfills";
 import "./styles.css";
 
 const rootElement = document.getElementById("root");
@@ -11,6 +10,7 @@ async function bootStash(): Promise<void> {
       throw new Error("Stash root element was not found.");
     }
 
+    await import("./polyfills");
     const { mountStashApp } = await import("./bootstrap");
     mountStashApp(rootElement);
   } catch (error) {
