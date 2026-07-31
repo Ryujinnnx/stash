@@ -1,6 +1,6 @@
 import type { InputTransactionData } from "@aptos-labs/wallet-adapter-react";
 import type { DatasetMetadata } from "./shelby";
-import { aptosIndexerUrl } from "./network";
+import { aptosFullnodeUrl, aptosIndexerUrl, configuredNetworkName } from "./network";
 
 export type DatasetCategory = "dataset" | "model" | "benchmark" | "embedding" | "agent" | "other";
 export type DatasetFormat = "csv" | "json" | "parquet" | "zip" | "safetensors" | "onnx" | "other";
@@ -69,8 +69,11 @@ export interface RegisterListingInput {
   priceOctas: number;
 }
 
+const DEFAULT_SHELBYNET_MARKETPLACE_MODULE_ADDRESS = "0x2d82e8802ab2a3fcce32df2f663a05efcbba9ae00d755b76d242dffb087a4a83";
+
 export const MARKETPLACE_MODULE_ADDRESS =
-  import.meta.env.VITE_STASH_MODULE_ADDRESS?.trim() ?? "";
+  import.meta.env.VITE_STASH_MODULE_ADDRESS?.trim() ||
+  (configuredNetworkName() === "shelbynet" ? DEFAULT_SHELBYNET_MARKETPLACE_MODULE_ADDRESS : "");
 
 export const INDEXER_GRAPHQL_URL =
   aptosIndexerUrl();
@@ -90,8 +93,27 @@ interface EventRow {
   account_address?: string;
 }
 
-interface EventsQueryResult {
-  events?: EventRow[];
+interface UserTransactionRow {
+  version: string | number;
+  sender?: string;
+}
+
+interface UserTransactionsQueryResult {
+  user_transactions?: UserTransactionRow[];
+}
+
+interface RestTransactionEvent {
+  sequence_number?: string | number;
+  guid?: { creation_number?: string | number; account_address?: string };
+  type?: string;
+  data?: unknown;
+}
+
+interface RestTransaction {
+  version?: string | number;
+  sender?: string;
+  success?: boolean;
+  events?: RestTransactionEvent[];
 }
 
 export async function fetchMarketplaceListings(filters: MarketplaceFilters): Promise<MarketplaceListing[]> {
@@ -146,6 +168,10 @@ export async function fetchMarketplaceStats(): Promise<MarketplaceStats> {
 }
 
 export function createListingPayload(input: RegisterListingInput): InputTransactionData {
+  if (input.priceOctas <= 0) {
+    throw new Error("Stash listings require an APT price greater than zero.");
+  }
+
   return {
     data: {
       function: marketplaceFunction("marketplace", "create_listing"),
@@ -193,20 +219,24 @@ async function fetchIndexerEvents(): Promise<EventRow[]> {
     return [];
   }
 
+  const transactions = await fetchStashTransactions();
+  if (transactions.length === 0) {
+    return [];
+  }
+
+  return fetchTransactionEvents(transactions);
+}
+
+async function fetchStashTransactions(): Promise<UserTransactionRow[]> {
   const query = `
-    query StashEvents($modulePrefix: String!) {
-      events(
-        where: { indexed_type: { _like: $modulePrefix } }
-        order_by: { transaction_version: desc }
+    query StashTransactions($contract: String!) {
+      user_transactions(
+        where: { entry_function_contract_address: { _eq: $contract } }
+        order_by: { version: desc }
         limit: 250
       ) {
-        sequence_number
-        creation_number
-        indexed_type
-        type
-        data
-        transaction_version
-        account_address
+        version
+        sender
       }
     }
   `;
@@ -217,7 +247,7 @@ async function fetchIndexerEvents(): Promise<EventRow[]> {
     body: JSON.stringify({
       query,
       variables: {
-        modulePrefix: `${MARKETPLACE_MODULE_ADDRESS}::%`,
+        contract: MARKETPLACE_MODULE_ADDRESS,
       },
     }),
   });
@@ -226,16 +256,67 @@ async function fetchIndexerEvents(): Promise<EventRow[]> {
     throw new Error(`Aptos Indexer returned HTTP ${response.status}`);
   }
 
-  const payload = (await response.json()) as GraphQlResponse<EventsQueryResult>;
+  const payload = (await response.json()) as GraphQlResponse<UserTransactionsQueryResult>;
   if (payload.errors?.length) {
     throw new Error(payload.errors.map((error) => error.message).join("; "));
   }
 
-  return payload.data?.events ?? [];
+  return payload.data?.user_transactions ?? [];
+}
+
+async function fetchTransactionEvents(transactions: UserTransactionRow[]): Promise<EventRow[]> {
+  const fullnode = aptosFullnodeUrl();
+  if (!fullnode) {
+    throw new Error("Aptos fullnode URL is required to load transaction events.");
+  }
+
+  const rows: EventRow[] = [];
+  for (const transaction of transactions) {
+    const response = await fetch(`${fullnode}/transactions/by_version/${transaction.version}`);
+    if (!response.ok) {
+      throw new Error(`Aptos fullnode returned HTTP ${response.status} for transaction ${transaction.version}`);
+    }
+
+    const detail = (await response.json()) as RestTransaction;
+    if (detail.success === false) {
+      continue;
+    }
+
+    const events = detail.events ?? [];
+    events
+      .filter((event) => isStashEventType(event.type))
+      .forEach((event) => {
+        const row: EventRow = {
+          data: event.data,
+          transaction_version: detail.version ?? transaction.version,
+        };
+        if (event.sequence_number !== undefined) {
+          row.sequence_number = event.sequence_number;
+        }
+        if (event.guid?.creation_number !== undefined) {
+          row.creation_number = event.guid.creation_number;
+        }
+        if (event.type) {
+          row.indexed_type = event.type;
+          row.type = event.type;
+        }
+        const sender = detail.sender ?? transaction.sender;
+        if (sender) {
+          row.account_address = sender;
+        }
+        rows.push(row);
+      });
+  }
+
+  return rows;
+}
+
+function isStashEventType(type: string | undefined): boolean {
+  return Boolean(type?.startsWith(`${MARKETPLACE_MODULE_ADDRESS}::`));
 }
 
 export function isMarketplaceConfigured(): boolean {
-  return MARKETPLACE_MODULE_ADDRESS.length > 0;
+  return isProductionModuleAddress(MARKETPLACE_MODULE_ADDRESS);
 }
 
 export function marketplaceFunction(moduleName: string, functionName: string): `${string}::${string}::${string}` {
@@ -438,4 +519,8 @@ function readStringArray(record: Record<string, unknown>, key: string): string[]
 function normalizeCategory(value: string): DatasetCategory {
   const allowed: DatasetCategory[] = ["dataset", "model", "benchmark", "embedding", "agent", "other"];
   return allowed.includes(value as DatasetCategory) ? (value as DatasetCategory) : "other";
+}
+function isProductionModuleAddress(value: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  return /^0x[a-f0-9]{1,64}$/.test(normalized) && normalized !== "0xcafe";
 }

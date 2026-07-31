@@ -15,6 +15,7 @@ import {
   purchasePayload,
   type RegisterListingInput,
 } from "../lib/marketplace";
+import { assertCanPublish, getRuntimeReadiness } from "../lib/readiness";
 import { hasConnectedAccount } from "../lib/wallet";
 
 interface TransactionResult {
@@ -59,6 +60,7 @@ export function useMarketplaceActions() {
   const wallet = useWallet();
   const queryClient = useQueryClient();
   const signer = wallet.signAndSubmitTransaction;
+  const readiness = useMemo(() => getRuntimeReadiness(), []);
 
   const canTransact = useMemo(
     () => Boolean(hasConnectedAccount(wallet.connected, wallet.account) && signer),
@@ -70,6 +72,7 @@ export function useMarketplaceActions() {
       if (!signer || !canTransact) {
         throw new Error("Connect a wallet before creating a listing");
       }
+      assertCanPublish(readiness);
       return (await signer(createListingPayload(input))) as TransactionResult;
     },
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["marketplace-listings"] }),
@@ -80,6 +83,7 @@ export function useMarketplaceActions() {
       if (!signer || !canTransact) {
         throw new Error("Connect a wallet before purchasing");
       }
+      assertCanPublish(readiness);
       return (await signer(purchasePayload(listingId))) as TransactionResult;
     },
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["marketplace-listings"] }),
@@ -90,6 +94,7 @@ export function useMarketplaceActions() {
       if (!signer || !canTransact) {
         throw new Error("Connect a wallet before claiming revenue");
       }
+      assertCanPublish(readiness);
       return (await signer(claimRevenuePayload(listingId))) as TransactionResult;
     },
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["creator-dashboard"] }),
@@ -100,6 +105,7 @@ export function useMarketplaceActions() {
       if (!signer || !canTransact) {
         throw new Error("Connect a wallet before delisting");
       }
+      assertCanPublish(readiness);
       return (await signer(delistPayload(listingId))) as TransactionResult;
     },
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["creator-dashboard"] }),

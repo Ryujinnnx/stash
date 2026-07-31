@@ -21,9 +21,10 @@ import type { LucideIcon } from "lucide-react";
 import { useMarketplaceActions } from "../hooks/useMarketplace";
 import { useUpload } from "../hooks/useShelby";
 import { formatBytes, parseAptToOctas } from "../lib/format";
-import { aptosClientConfig } from "../lib/network";
+import { aptosClientConfig, walletNetworkMatchesConfigured } from "../lib/network";
 import type { DatasetMetadata } from "../lib/shelby";
 import type { UploadProgress } from "../lib/shelby";
+import { getRuntimeReadiness, type RuntimeReadiness } from "../lib/readiness";
 import { hasConnectedAccount } from "../lib/wallet";
 import { Button } from "../components/ui/Button";
 import { Input } from "../components/ui/Input";
@@ -63,6 +64,7 @@ interface AccessOption {
   icon: LucideIcon;
   title: string;
   description: string;
+  available: boolean;
 }
 
 const steps = ["Files", "Metadata", "Pricing", "Review", "Publishing"];
@@ -93,19 +95,22 @@ const accessOptions: AccessOption[] = [
     value: "public",
     icon: Globe,
     title: "Public",
-    description: "Anyone can access for free",
+    description: "Coming after free-access contract support",
+    available: false,
   },
   {
     value: "gated",
     icon: Lock,
     title: "Gated",
-    description: "Only wallets you approve",
+    description: "Coming after allowlist contract support",
+    available: false,
   },
   {
     value: "paid",
     icon: Wallet,
     title: "Paid",
     description: "Buyers pay once to download",
+    available: true,
   },
 ];
 
@@ -142,10 +147,12 @@ export function Upload() {
   const metadataValidation = validateMetadata(metadata);
   const pricingValidation = validatePricing(pricing);
   const walletConnected = hasConnectedAccount(wallet.connected, wallet.account);
+  const walletNetworkReady = !walletConnected || walletNetworkMatchesConfigured(wallet.network);
+  const readiness = useMemo(() => getRuntimeReadiness(), []);
   const canContinueFiles = files.length > 0;
   const canContinueMetadata = metadataValidation.valid;
   const canContinuePricing = pricingValidation.valid;
-  const canPublish = canContinueFiles && canContinueMetadata && canContinuePricing && publishPhase !== "shelby" && publishPhase !== "signature" && publishPhase !== "confirming";
+  const canPublish = canContinueFiles && canContinueMetadata && canContinuePricing && readiness.canPublish && walletNetworkReady && publishPhase !== "shelby" && publishPhase !== "signature" && publishPhase !== "confirming";
 
   function goToStep(nextStep: UploadStep) {
     direction.current = nextStep >= step ? "forward" : "back";
@@ -160,6 +167,16 @@ export function Upload() {
 
     if (!walletConnected) {
       toast.info("Connect wallet first", "Choose an Aptos wallet in the review step, then publish again.");
+      return;
+    }
+
+    if (!walletNetworkReady) {
+      toast.error("Wrong network", `Switch Petra to ${readiness.networkName} before publishing.`);
+      return;
+    }
+
+    if (!readiness.canPublish) {
+      toast.error("Shelbinet setup incomplete", readiness.blockers[0] ?? "Finish network configuration before publishing.");
       return;
     }
 
@@ -265,6 +282,8 @@ export function Upload() {
               totalSize={totalSize}
               canPublish={canPublish}
               walletConnected={walletConnected}
+              walletNetworkReady={walletNetworkReady}
+              readiness={readiness}
               onBack={() => goToStep(2)}
               onPublish={() => void publishDataset()}
             />
@@ -543,16 +562,19 @@ function PricingStep({
 }) {
   const priceMessage = validation.field === "price" || validation.field === "currency" ? validation.message : undefined;
 
-  function chooseAccessType(accessType: AccessType) {
-    setPricing({ ...pricing, accessType });
+  function chooseAccessType(option: AccessOption) {
+    if (!option.available) {
+      return;
+    }
+    setPricing({ ...pricing, accessType: option.value });
   }
 
-  function handleOptionKeyDown(event: KeyboardEvent<HTMLLabelElement>, accessType: AccessType) {
+  function handleOptionKeyDown(event: KeyboardEvent<HTMLLabelElement>, option: AccessOption) {
     if (event.key !== "Enter" && event.key !== " ") {
       return;
     }
     event.preventDefault();
-    chooseAccessType(accessType);
+    chooseAccessType(option);
   }
 
   return (
@@ -573,15 +595,20 @@ function PricingStep({
               aria-checked={selected}
               tabIndex={0}
               data-selected={selected ? "true" : "false"}
-              onKeyDown={(event) => handleOptionKeyDown(event, option.value)}
-              className="access-option flex cursor-pointer items-center gap-4 rounded-[var(--r-xl)] border-[1.5px] border-[var(--border)] px-5 py-[18px] text-left transition-all duration-[180ms] ease-expo focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
+              aria-disabled={!option.available}
+              onKeyDown={(event) => handleOptionKeyDown(event, option)}
+              className={clsx(
+                "access-option flex items-center gap-4 rounded-[var(--r-xl)] border-[1.5px] border-[var(--border)] px-5 py-[18px] text-left transition-all duration-[180ms] ease-expo focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-bg",
+                option.available ? "cursor-pointer" : "cursor-not-allowed opacity-55",
+              )}
             >
               <input
                 type="radio"
                 name="access-type"
                 value={option.value}
                 checked={selected}
-                onChange={() => chooseAccessType(option.value)}
+                disabled={!option.available}
+                onChange={() => chooseAccessType(option)}
               />
               <span className="access-option-icon flex h-10 w-10 shrink-0 items-center justify-center rounded-[var(--r-lg)] border border-[var(--border)] bg-high transition-all duration-[180ms] ease-expo">
                 <option.icon className="h-[18px] w-[18px] text-t3 transition-colors duration-[180ms] ease-expo" aria-hidden="true" />
@@ -589,6 +616,7 @@ function PricingStep({
               <span className="min-w-0 pr-7">
                 <span className="mb-[3px] block font-display text-[15px] font-medium tracking-[-0.01em] text-t1">{option.title}</span>
                 <span className="block font-body text-[12px] font-light leading-[1.5] text-t2">{option.description}</span>
+                {!option.available && <span className="mt-2 block font-mono text-[10px] uppercase tracking-[0.08em] text-warning">Not available in Phase 1</span>}
               </span>
             </label>
           );
@@ -655,6 +683,8 @@ function ReviewStep({
   totalSize,
   canPublish,
   walletConnected,
+  walletNetworkReady,
+  readiness,
   onBack,
   onPublish,
 }: {
@@ -665,6 +695,8 @@ function ReviewStep({
   totalSize: number;
   canPublish: boolean;
   walletConnected: boolean;
+  walletNetworkReady: boolean;
+  readiness: RuntimeReadiness;
   onBack: () => void;
   onPublish: () => void;
 }) {
@@ -694,11 +726,34 @@ function ReviewStep({
         </div>
       </div>
 
-      <div className="mt-5 flex items-start gap-3 rounded-xl border border-[var(--border)] bg-raised p-4">
-        <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-t3" aria-hidden="true" />
-        <p className="font-body text-sm font-light text-t3">
-          <span className="font-medium text-t1">Two signatures required.</span> First to upload to Shelby, then to register on Aptos.
-        </p>
+      <div className="mt-5 grid gap-3">
+        <div className="flex items-start gap-3 rounded-xl border border-[var(--border)] bg-raised p-4">
+          <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-t3" aria-hidden="true" />
+          <p className="font-body text-sm font-light text-t3">
+            <span className="font-medium text-t1">Two signatures required.</span> First to upload to Shelby, then to register on Aptos.
+          </p>
+        </div>
+
+        {!walletNetworkReady && (
+          <div className="rounded-xl border border-[rgba(245,158,11,0.22)] bg-[var(--warning-soft)] p-4">
+            <p className="font-body text-sm font-medium text-warning">Switch wallet network</p>
+            <p className="mt-1 font-body text-sm font-light text-t2">Petra must be connected to {readiness.networkName} before Stash can publish this listing.</p>
+          </div>
+        )}
+
+        {!readiness.canPublish && (
+          <div className="rounded-xl border border-[rgba(239,68,68,0.18)] bg-[var(--error-soft)] p-4">
+            <p className="font-body text-sm font-medium text-error">Shelbinet setup incomplete</p>
+            <p className="mt-1 font-body text-sm font-light text-t2">{readiness.blockers[0] ?? "Finish network configuration before publishing."}</p>
+          </div>
+        )}
+
+        {readiness.warnings.length > 0 && readiness.canPublish && (
+          <div className="rounded-xl border border-[rgba(245,158,11,0.16)] bg-[var(--warning-soft)] p-4">
+            <p className="font-body text-sm font-medium text-warning">Network warning</p>
+            <p className="mt-1 font-body text-sm font-light text-t2">{readiness.warnings[0]}</p>
+          </div>
+        )}
       </div>
 
       <div className="mt-8 grid gap-3">

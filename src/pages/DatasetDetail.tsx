@@ -1,4 +1,4 @@
-import { forwardRef, useEffect, useMemo, useRef } from "react";
+import { forwardRef, useLayoutEffect, useMemo, useRef } from "react";
 import type { RefObject } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
@@ -9,10 +9,11 @@ import { ScrollTrigger } from "gsap/ScrollTrigger";
 import { Archive, Binary, Database, FileArchive, FileJson, FileText, Image, Lock, Music, Video } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { useDatasetListing, useMarketplaceActions } from "../hooks/useMarketplace";
-import { useMetadata } from "../hooks/useShelby";
+import { useDownload, useMetadata } from "../hooks/useShelby";
 import { formatBytes, formatDate } from "../lib/format";
 import { isMarketplaceConfigured, marketplaceFunction, type MarketplaceListing } from "../lib/marketplace";
 import { aptosClientConfig, walletNetworkMatchesConfigured } from "../lib/network";
+import { createAccessProof, importBuyerPrivateKey } from "../lib/shelby";
 import type { DatasetMetadata } from "../lib/shelby";
 import { resolveAccountAddress } from "../lib/wallet";
 import { Badge } from "../components/ui/Badge";
@@ -48,6 +49,7 @@ export function DatasetDetail() {
   const metadata = useMetadata(listing.data?.storageId ?? null);
   const accountAddress = resolveAccountAddress(wallet.account);
   const access = useAccessStatus(accountAddress, id, actions.purchase.isSuccess);
+  const download = useDownload(listing.data?.storageId ?? null);
 
   const coverRef = useRef<HTMLDivElement>(null);
   const titleRef = useRef<HTMLHeadingElement>(null);
@@ -96,18 +98,40 @@ export function DatasetDetail() {
     }
   }
 
-  function downloadDataset() {
+  async function downloadDataset() {
+    if (!dataset) {
+      return;
+    }
+
     if (!isPurchased) {
       toast.error("Access is still locked", "Complete the on-chain purchase before downloading this dataset.");
       return;
     }
 
-    toast.info(
-      "Access verified on-chain",
-      "Download handoff needs the Shelby access proof and buyer decryption key. Add those credentials to complete delivery.",
-    );
-  }
+    const privateKey = readLocalAccessKey(dataset.storageId);
+    if (!privateKey) {
+      toast.error(
+        "Delivery key unavailable",
+        "Access is confirmed on-chain, but this browser does not have the decryption key for this Shelby object yet.",
+      );
+      return;
+    }
 
+    try {
+      const buyerPrivateKey = await importBuyerPrivateKey(privateKey);
+      const accessProof = createAccessProof({
+        storage_id: dataset.storageId,
+        encrypted_key: "",
+        expires_at: Date.now() + 5 * 60 * 1000,
+        ...(accountAddress ? { issuer: accountAddress } : {}),
+      });
+      const blob = await download.download(accessProof, buyerPrivateKey);
+      saveBlob(blob, dataset.files[0]?.name ?? fileNameForDataset(dataset.title, dataset.format));
+      toast.success("Download ready", "The Shelby file was decrypted in your browser.");
+    } catch (error) {
+      toast.error("Download failed", getErrorMessage(error, "Verify access, network, and Shelby delivery configuration, then try again."));
+    }
+  }
   if (listing.isLoading) {
     return <DatasetDetailSkeleton />;
   }
@@ -198,24 +222,46 @@ const DatasetCover = forwardRef<HTMLDivElement, { dataset: DatasetView }>(functi
   const coverKind = dataset.preview.kind === "image" ? "image" : "placeholder";
 
   return (
-    <div ref={ref} className="mb-8 aspect-video w-full overflow-hidden rounded-2xl bg-raised">
+    <div
+      ref={ref}
+      className="mb-8 aspect-video w-full overflow-hidden rounded-2xl border border-[var(--border)] bg-raised shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]"
+    >
       {coverKind === "image" && dataset.preview.url ? (
         <img src={dataset.preview.url} alt="" className="h-full w-full object-cover" />
       ) : (
-        <div className="flex h-full flex-col justify-between border border-[var(--border)] p-6">
-          <div className="flex items-center justify-between gap-3">
+        <div className="relative flex h-full flex-col justify-between overflow-hidden bg-[radial-gradient(circle_at_18%_12%,rgba(99,102,241,0.14),transparent_28%),linear-gradient(155deg,rgba(13,13,26,1),rgba(8,8,16,1))] p-6">
+          <div
+            className="absolute inset-0 opacity-70 [background-image:linear-gradient(rgba(255,255,255,0.018)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.018)_1px,transparent_1px)] [background-size:40px_40px]"
+            aria-hidden="true"
+          />
+          <div className="relative flex items-center justify-between gap-3">
             <Badge variant="accent">{dataset.category}</Badge>
-            <span className="font-mono text-2xs uppercase tracking-widest text-t3">Shelby storage</span>
+            <span className="font-mono text-2xs uppercase tracking-widest text-t3">Shelby artifact</span>
           </div>
-          <div className="grid gap-3">
-            <div className="grid grid-cols-8 gap-2">
-              {Array.from({ length: 24 }, (_, index) => (
-                <span key={index} className="h-1 rounded-full bg-high" />
+          <div className="relative grid gap-5">
+            <div className="flex items-end justify-between gap-6">
+              <div className="min-w-0">
+                <p className="mb-3 font-mono text-2xs uppercase tracking-widest text-t3">Encrypted storage object</p>
+                <p className="truncate font-display text-2xl font-medium leading-tight text-t1">{dataset.title}</p>
+              </div>
+              <div className="hidden shrink-0 rounded-lg border border-[var(--border)] bg-bg/50 px-3 py-2 font-mono text-2xs uppercase tracking-widest text-t3 sm:block">
+                {dataset.format}
+              </div>
+            </div>
+            <div className="grid grid-cols-12 gap-2">
+              {Array.from({ length: 36 }, (_, index) => (
+                <span
+                  key={index}
+                  className={index % 5 === 0 ? "h-1 rounded-full bg-accent/70" : "h-1 rounded-full bg-high"}
+                />
               ))}
             </div>
-            <div className="h-0.5 w-2/3 rounded-full bg-accent" />
+            <div className="h-px w-full bg-gradient-to-r from-transparent via-accent/70 to-transparent" />
           </div>
-          <p className="font-mono text-2xs uppercase tracking-widest text-t3">Encrypted dataset artifact</p>
+          <div className="relative flex items-center justify-between gap-4">
+            <p className="min-w-0 truncate font-mono text-2xs uppercase tracking-widest text-t3">{dataset.storageId}</p>
+            <p className="shrink-0 font-mono text-2xs uppercase tracking-widest text-t3">{formatBytes(dataset.sizeBytes)}</p>
+          </div>
         </div>
       )}
     </div>
@@ -413,34 +459,37 @@ function useDetailAnimations({
   fileListRef: RefObject<HTMLElement | null>;
   enabled: boolean;
 }) {
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!enabled || window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
       return undefined;
     }
 
-    const timeline = gsap.timeline({ defaults: { ease: "power3.out" } });
-    if (coverRef.current) {
-      timeline.from(coverRef.current, { opacity: 0, y: 16, duration: 0.6 });
-    }
-    if (titleRef.current) {
-      timeline.from(titleRef.current, { opacity: 0, y: 12, duration: 0.5 }, "-=0.3");
-    }
-    if (creatorRef.current) {
-      timeline.from(creatorRef.current, { opacity: 0, y: 8, duration: 0.4 }, "-=0.3");
-    }
-    if (descriptionRef.current) {
-      timeline.from(descriptionRef.current, { opacity: 0, y: 8, duration: 0.4 }, "-=0.2");
-    }
-    if (purchasePanelRef.current) {
-      timeline.from(purchasePanelRef.current, { opacity: 0, x: 12, duration: 0.5 }, "-=0.5");
-    }
+    const context = gsap.context(() => {
+      const timeline = gsap.timeline({ defaults: { ease: "power3.out" } });
+      if (coverRef.current) {
+        timeline.fromTo(coverRef.current, { opacity: 0, y: 16 }, { opacity: 1, y: 0, duration: 0.6 });
+      }
+      if (titleRef.current) {
+        timeline.fromTo(titleRef.current, { opacity: 0, y: 12 }, { opacity: 1, y: 0, duration: 0.5 }, "-=0.3");
+      }
+      if (creatorRef.current) {
+        timeline.fromTo(creatorRef.current, { opacity: 0, y: 8 }, { opacity: 1, y: 0, duration: 0.4 }, "-=0.3");
+      }
+      if (descriptionRef.current) {
+        timeline.fromTo(descriptionRef.current, { opacity: 0, y: 8 }, { opacity: 1, y: 0, duration: 0.4 }, "-=0.2");
+      }
+      if (purchasePanelRef.current) {
+        timeline.fromTo(purchasePanelRef.current, { opacity: 0, x: 12 }, { opacity: 1, x: 0, duration: 0.5 }, "-=0.5");
+      }
 
-    const fileRows = fileListRef.current?.querySelectorAll(fileRowSelector);
-    const fileTrigger =
-      fileRows && fileRows.length > 0 && fileListRef.current
-        ? gsap.from(fileRows, {
-            opacity: 0,
-            y: 10,
+      const fileRows = fileListRef.current?.querySelectorAll(fileRowSelector);
+      if (fileRows && fileRows.length > 0 && fileListRef.current) {
+        gsap.fromTo(
+          fileRows,
+          { opacity: 0, y: 10 },
+          {
+            opacity: 1,
+            y: 0,
             duration: 0.34,
             stagger: 0.04,
             ease: "power3.out",
@@ -448,17 +497,13 @@ function useDetailAnimations({
               trigger: fileListRef.current,
               start: "top 82%",
             },
-          })
-        : null;
+          },
+        );
+      }
+    });
 
     return () => {
-      timeline.kill();
-      fileTrigger?.kill();
-      ScrollTrigger.getAll().forEach((trigger) => {
-        if (trigger.trigger === fileListRef.current) {
-          trigger.kill();
-        }
-      });
+      context.revert();
     };
   }, [coverRef, creatorRef, descriptionRef, enabled, fileListRef, purchasePanelRef, titleRef]);
 }
@@ -586,6 +631,25 @@ function normalizeTimestamp(timestamp: number): number {
   return timestamp < 10_000_000_000 ? timestamp * 1000 : timestamp;
 }
 
+function readLocalAccessKey(storageId: string): string | null {
+  try {
+    return sessionStorage.getItem(`stash:access-key:${storageId}`);
+  } catch {
+    return null;
+  }
+}
+
+function saveBlob(blob: Blob, fileName: string): void {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = fileName;
+  anchor.rel = "noopener";
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
 function fileNameForDataset(title: string, format: string): string {
   const safeTitle = title
     .trim()

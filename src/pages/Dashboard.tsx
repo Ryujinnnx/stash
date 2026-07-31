@@ -2,12 +2,13 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useWallet } from "@aptos-labs/wallet-adapter-react";
 import gsap from "gsap";
 import { ScrollTrigger } from "gsap/ScrollTrigger";
-import { ArrowRight, ArrowUpDown, BarChart2, Database, UploadCloud, Wallet } from "lucide-react";
+import { AlertTriangle, ArrowRight, ArrowUpDown, BarChart2, Database, UploadCloud, Wallet } from "lucide-react";
 import { Link, useNavigate } from "react-router-dom";
 import { clsx } from "clsx";
 import { useCreatorDashboard } from "../hooks/useMarketplace";
 import { formatApt, formatDate } from "../lib/format";
 import type { CreatorTransaction, MarketplaceListing } from "../lib/marketplace";
+import { getRuntimeReadiness, type RuntimeReadiness } from "../lib/readiness";
 import { resolveAccountAddress } from "../lib/wallet";
 import { Button } from "../components/ui/Button";
 import { ErrorState } from "../components/ui/ErrorState";
@@ -46,6 +47,7 @@ export function Dashboard() {
   const accountAddress = resolveAccountAddress(wallet.account);
   const dashboard = useCreatorDashboard(accountAddress);
   const connected = Boolean(wallet.connected && accountAddress);
+  const readiness = useMemo(() => getRuntimeReadiness(), []);
 
   useEffect(() => {
     const page = pageRef.current;
@@ -99,8 +101,9 @@ export function Dashboard() {
           Publish dataset
         </Button>
       </header>
+      {!readiness.marketplaceConfigured && <DashboardSetupState readiness={readiness} />}
 
-      {dashboard.isError && (
+      {readiness.marketplaceConfigured && dashboard.isError && (
         <ErrorState
           error={dashboard.error}
           title="Dashboard could not load"
@@ -108,7 +111,7 @@ export function Dashboard() {
         />
       )}
 
-      {!dashboard.isError && (
+      {readiness.marketplaceConfigured && !dashboard.isError && (
         <>
           <SummaryBar
             loading={dashboard.isLoading}
@@ -129,6 +132,29 @@ export function Dashboard() {
           <RecentTransactions transactions={dashboard.data?.recentTransactions ?? []} />
         </>
       )}
+    </section>
+  );
+}
+
+function DashboardSetupState({ readiness }: { readiness: RuntimeReadiness }) {
+  return (
+    <section className="mb-10 rounded-2xl border border-[rgba(245,158,11,0.22)] bg-[var(--warning-soft)] p-6">
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-start">
+        <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-[rgba(245,158,11,0.22)] bg-bg text-warning">
+          <AlertTriangle className="h-5 w-5" aria-hidden="true" />
+        </span>
+        <div className="min-w-0">
+          <h2 className="font-display text-xl font-normal tracking-[-0.025em] text-t1">Contract configuration required</h2>
+          <p className="mt-2 max-w-2xl font-body text-sm font-light leading-relaxed text-t2">
+            Publish the Stash Move package to {readiness.networkName}, then set <span className="font-mono text-t1">VITE_STASH_MODULE_ADDRESS</span>. Dashboard revenue, listings, and transactions are hidden until real indexer events are available.
+          </p>
+          <div className="mt-4 grid gap-1 font-mono text-[11px] leading-relaxed text-t3">
+            <p>Network: {readiness.networkName}</p>
+            <p>Indexer: {readiness.aptosIndexerUrl}</p>
+            <p>Module: {readiness.marketplaceModuleAddress ?? "missing"}</p>
+          </div>
+        </div>
+      </div>
     </section>
   );
 }

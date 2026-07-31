@@ -202,7 +202,7 @@ VITE_APTOS_NETWORK=shelbynet
 VITE_APTOS_FULLNODE_URL=https://api.shelbynet.shelby.xyz/v1
 VITE_APTOS_INDEXER_URL=https://api.shelbynet.shelby.xyz/v1/graphql
 VITE_SHELBY_RPC_URL=https://api.shelbynet.shelby.xyz/shelby
-VITE_STASH_MODULE_ADDRESS=0x...
+VITE_STASH_MODULE_ADDRESS=0x2d82e8802ab2a3fcce32df2f663a05efcbba9ae00d755b76d242dffb087a4a83
 
 # Optional, depending on network/provider requirements
 VITE_APTOS_API_KEY=
@@ -278,3 +278,93 @@ License is not finalized yet. Treat this repository as proprietary during active
 **Stash is built for data ownership, on-chain access, and decentralized distribution.**
 
 </div>
+
+## Current Shelbinet Deployment
+
+The Stash Move package is deployed on Shelbinet.
+
+| Item | Value |
+| --- | --- |
+| Network | `shelbynet` |
+| Package address | `0x2d82e8802ab2a3fcce32df2f663a05efcbba9ae00d755b76d242dffb087a4a83` |
+| Publish transaction | `0x005794789e05b80ae3dbb91bd0027180bd4f754b633fa3b82e9c8ad5faf7153c` |
+| Fullnode | `https://api.shelbynet.shelby.xyz/v1` |
+| Indexer | `https://api.shelbynet.shelby.xyz/v1/graphql` |
+| Shelby RPC | `https://api.shelbynet.shelby.xyz/shelby` |
+
+The frontend includes this package address as the default Shelbinet module address. `VITE_STASH_MODULE_ADDRESS` can still override it for future redeployments.
+## Shelbinet Launch Runbook
+
+Stash is configured to target Shelbinet by default and includes the current Shelbinet package address. A real Shelby CLI upload has been validated on Shelbinet; browser uploads still depend on the connected wallet having ShelbyUSD, a Shelby write location, and any API key required by the active early-access RPC policy.
+
+### 1. Create a Shelbinet Aptos CLI profile
+
+Use the deploy wallet you want to own the Stash Move package. Do not commit private keys.
+
+```powershell
+aptos init --network custom `
+  --rest-url https://api.shelbynet.shelby.xyz/v1 `
+  --skip-faucet `
+  --profile shelbynet
+```
+
+If you already have the deploy key, initialize with `--private-key` or `--private-key-file`. The account must have enough gas on Shelbinet before publishing.
+
+### 2. Publish the Move package
+
+Replace `<deployer-address>` with the account address from the `shelbynet` profile.
+
+```powershell
+.\scripts\publish-shelbynet.ps1 -Address <deployer-address> -Profile shelbynet
+```
+
+The script compiles the Move package with `stash=<deployer-address>`, runs Move tests, then publishes against the Shelbinet fullnode.
+
+### 3. Set frontend environment
+
+Create `.env.local` locally and mirror the same values in the hosting provider.
+
+```env
+VITE_APTOS_NETWORK=shelbynet
+VITE_APTOS_FULLNODE_URL=https://api.shelbynet.shelby.xyz/v1
+VITE_APTOS_INDEXER_URL=https://api.shelbynet.shelby.xyz/v1/graphql
+VITE_SHELBY_RPC_URL=https://api.shelbynet.shelby.xyz/shelby
+VITE_STASH_MODULE_ADDRESS=0x2d82e8802ab2a3fcce32df2f663a05efcbba9ae00d755b76d242dffb087a4a83
+VITE_SHELBY_API_KEY=
+VITE_APTOS_API_KEY=
+```
+
+`VITE_STASH_MODULE_ADDRESS` is mandatory for marketplace, dashboard, upload publish, purchase, claim revenue, and access verification. `0xcafe` is intentionally rejected by the frontend because it is only the dev-test address from `Move.toml`.
+
+### 4. Verify Shelby storage
+
+A real Shelbinet upload was completed with the Shelby CLI using the deployed package wallet.
+
+| Item | Value |
+| --- | --- |
+| CLI context | `shelbynet` |
+| Write location | `shelbynet-1` |
+| Upload transaction | `0x9fcd01ba1721359c22543a7bb00a06b214c45e6b93afb0c3e1d3928ca9fdc8be` |
+| Explorer | `https://explorer.shelby.xyz/shelbynet/account/0x2d82e8802ab2a3fcce32df2f663a05efcbba9ae00d755b76d242dffb087a4a83` |
+
+If browser upload fails before the Petra signature, confirm the connected wallet has ShelbyUSD and a Shelby write location. The CLI validation used `shelbynet-1` explicitly.
+
+### 5. Verify the app
+
+```powershell
+.\scripts\check-shelbynet.ps1
+npm.cmd run build
+```
+
+Manual E2E checklist:
+
+1. Connect Petra on Shelbinet.
+2. Upload a small file from `/upload`.
+3. Confirm the Shelby blob registration popup appears.
+4. Confirm the Stash listing registration popup appears.
+5. Confirm the listing appears in `/marketplace` from Aptos Indexer events.
+6. Purchase from another wallet.
+7. Confirm `access::verify_access` returns `true`.
+8. Download and decrypt the Shelby file.
+
+Current delivery note: the browser can decrypt downloads only when it has the matching local access key for the Shelby object. Production buyer delivery still needs a proper buyer key handoff/key-wrapping path before this can be called fully trustless for arbitrary buyers.

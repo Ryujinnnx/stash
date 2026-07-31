@@ -11,6 +11,7 @@ interface ImportMetaEnv {
   readonly VITE_STASH_DISCORD_URL?: string;
   readonly VITE_SHELBY_API_KEY?: string;
   readonly VITE_SHELBY_RPC_URL?: string;
+  readonly VITE_SHELBY_WRITE_LOCATION?: string;
 }
 
 interface ImportMeta {

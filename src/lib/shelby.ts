@@ -1,11 +1,16 @@
-import { AccountAddress, Aptos, AptosConfig, Network } from "@aptos-labs/ts-sdk";
+import { AccountAddress, Aptos, AptosConfig, Hex, Network } from "@aptos-labs/ts-sdk";
 import {
+  createBlobKey,
   createDefaultErasureCodingProvider,
   defaultErasureCodingConfig,
+  ERASURE_CODE_AND_CHUNK_MAPPING,
   expectedTotalChunksets,
+  findErasureSchemeByErasureN,
   generateCommitments,
+  readInChunks,
   ShelbyBlobClient,
   ShelbyClient,
+  type StorageProviderAck,
 } from "@shelby-protocol/sdk/browser";
 import { aptosClientConfig, resolveAptosNetwork, shelbyRpcUrl } from "./network";
 
@@ -69,9 +74,18 @@ export type SignAndSubmitTransaction = (
   transaction: TransactionRequest,
 ) => Promise<{ hash: string }>;
 
+export interface ShelbyChallengeSignature {
+  challenge: string;
+  signature: ByteArray;
+  publicKey: ByteArray;
+}
+
+export type SignShelbyChallenge = (challenge: string) => Promise<ShelbyChallengeSignature>;
+
 export interface ShelbyStorageContext {
   accountAddress?: string;
   signAndSubmitTransaction?: SignAndSubmitTransaction;
+  signShelbyChallenge?: SignShelbyChallenge;
   buyerPublicKey?: CryptoKey;
   buyerPrivateKey?: CryptoKey;
   aptos?: Aptos;
@@ -86,9 +100,15 @@ export interface ShelbyStorageContext {
   onProgress?: (progress: UploadProgress) => void;
 }
 
+interface ChunksetCommitment {
+  chunkset_root: string;
+  chunk_commitments: string[];
+}
+
 interface BlobCommitments {
   blob_merkle_root: string;
   raw_data_size: number;
+  chunkset_commitments: ChunksetCommitment[];
 }
 
 interface StorageIdPayload {
@@ -138,9 +158,14 @@ let shelbyClient: ShelbyClient | null = null;
 
 export function configureShelbyStorage(context: ShelbyStorageContext): void {
   storageContext = context;
+  const writeLocation = resolveShelbyWriteLocation(context);
   const clientConfig: ConstructorParameters<typeof ShelbyClient>[0] = {
     network: context.network ?? resolveShelbyNetwork(),
+    rpc: { baseUrl: context.rpcUrl ?? shelbyRpcUrl() },
   };
+  if (writeLocation) {
+    clientConfig.locationHint = writeLocation;
+  }
   const apiKey = context.apiKey ?? import.meta.env.VITE_SHELBY_API_KEY;
   if (apiKey) {
     clientConfig.apiKey = apiKey;
@@ -280,7 +305,8 @@ async function registerAndUploadBlob(
   const erasureConfig = defaultErasureCodingConfig();
   let payload: ReturnType<typeof ShelbyBlobClient.createRegisterBlobPayload>;
   try {
-    payload = ShelbyBlobClient.createRegisterBlobPayload({
+    const selectedLocation = resolveShelbyWriteLocation(context);
+    const payloadParams: Parameters<typeof ShelbyBlobClient.createRegisterBlobPayload>[0] = {
       account: AccountAddress.fromString(accountAddress),
       blobName,
       blobMerkleRoot: commitments.blob_merkle_root,
@@ -288,7 +314,11 @@ async function registerAndUploadBlob(
       expirationMicros: expirationMicros(context.uploadTtlDays ?? DEFAULT_UPLOAD_TTL_DAYS),
       blobSize: commitments.raw_data_size,
       encoding: erasureConfig.enumIndex,
-    });
+    };
+    if (selectedLocation) {
+      payloadParams.selectedLocation = selectedLocation;
+    }
+    payload = ShelbyBlobClient.createRegisterBlobPayload(payloadParams);
   } catch (error) {
     throw new ShelbyStorageError("UPLOAD_FAILED", "Could not build the Shelby blob registration transaction", error);
   }
@@ -305,39 +335,247 @@ async function registerAndUploadBlob(
     if (isWalletRejectionError(error)) {
       throw new ShelbyStorageError("USER_REJECTED", "Wallet request was rejected. Shelby upload was stopped.", error);
     }
-    throw new ShelbyStorageError("UPLOAD_FAILED", "Wallet failed before signing the Shelby blob registration", error);
+    throw createShelbyRegistrationError(error);
   }
 
   reportProgress(context, "registering", 56, "Confirming Shelby blob registration on-chain");
   try {
     throwIfAborted(context);
-    await (context.aptos ?? createAptosClient(context)).waitForTransaction({
+    const confirmedRegistration = await (context.aptos ?? createAptosClient(context)).waitForTransaction({
       transactionHash: submitted.hash,
     });
+    const uid = resolveRegisteredBlobUid(confirmedRegistration, client, accountAddress, blobName);
+
+    reportProgress(context, "uploading", 62, "Authorizing Shelby RPC upload");
+    const storageProviderAcks = await uploadShelbyChunksets(client, context, accountAddress, uid, blobName, blobData, commitments);
+
+    reportProgress(context, "uploading", 76, "Committing Shelby object");
+    await commitShelbyObject(client, context, uid, blobName, storageProviderAcks);
   } catch (error) {
     throw new ShelbyStorageError("UPLOAD_FAILED", "Shelby blob registration transaction was not confirmed", error);
   }
 
-  reportProgress(context, "uploading", 65, `Uploading ${blobName} to Shelby RPC`);
-  await withRetry(
-    async () => {
-      throwIfAborted(context);
-      try {
-        await client.rpc.putBlob({
-          account: accountAddress,
-          blobName,
-          blobData,
-        });
-      } catch (error) {
-        throw createShelbyRpcUploadError(error);
-      }
-    },
-    context.maxUploadRetries ?? DEFAULT_MAX_UPLOAD_RETRIES,
-    "UPLOAD_FAILED",
-    context,
-  );
+
 }
 
+interface ConfirmedTransactionWithEvents {
+  events?: ReadonlyArray<{ type: string; data: unknown }>;
+}
+
+function resolveRegisteredBlobUid(
+  confirmedRegistration: unknown,
+  client: ShelbyClient,
+  accountAddress: string,
+  blobName: string,
+): bigint {
+  const events = (confirmedRegistration as ConfirmedTransactionWithEvents).events ?? [];
+  const registered = ShelbyBlobClient.registeredBlobUids(events, client.coordination.deployer);
+  const objectName = createBlobKey({ account: AccountAddress.fromString(accountAddress), blobName });
+  const match = registered.find((entry) => entry.objectName === objectName || entry.objectName.endsWith(`/${blobName}`));
+
+  if (!match) {
+    throw new ShelbyStorageError("UPLOAD_FAILED", `Shelby registration did not return a blob UID for ${blobName}`);
+  }
+
+  return match.uid;
+}
+
+async function uploadShelbyChunksets(
+  client: ShelbyClient,
+  context: ShelbyStorageContext,
+  accountAddress: string,
+  uid: bigint,
+  blobName: string,
+  blobData: ByteArray,
+  commitments: BlobCommitments,
+): Promise<StorageProviderAck[]> {
+  const signShelbyChallenge = requireSignShelbyChallenge(context);
+  const totalBytes = blobData.byteLength;
+  const firstChunkset = commitments.chunkset_commitments[0];
+  if (!firstChunkset) {
+    throw new ShelbyStorageError("UPLOAD_FAILED", "Shelby commitments did not include any chunksets");
+  }
+
+  const erasureScheme = findErasureSchemeByErasureN(firstChunkset.chunk_commitments.length);
+  if (!erasureScheme) {
+    throw new ShelbyStorageError("UPLOAD_FAILED", `Unsupported Shelby erasure scheme with ${firstChunkset.chunk_commitments.length} chunks`);
+  }
+
+  const [schemeKey, scheme] = erasureScheme;
+  const chunksetSize = scheme.erasure_k * ERASURE_CODE_AND_CHUNK_MAPPING[schemeKey].chunkSizeBytes;
+  const chunksetRoots = commitments.chunkset_commitments.map((chunkset) => Hex.fromHexString(chunkset.chunkset_root));
+  const { challenge } = await client.rpc.getChallenge(AccountAddress.fromString(accountAddress));
+  const auth = await signShelbyChallenge(challenge);
+  const aggregatedAcks = new Map<number, ByteArray>();
+  let uploadedBytes = 0;
+
+  reportProgress(context, "uploading", 66, "Upload authorization signed in wallet");
+
+  for await (const [chunksetIndex, chunksetData] of readInChunks(blobData, chunksetSize)) {
+    throwIfAborted(context);
+    const proofSiblings = await generateChunksetInclusionProof(chunksetRoots, chunksetIndex);
+    const inclusionProof = encodeInclusionProof(proofSiblings);
+    const result = await uploadShelbyChunkset(client, context, accountAddress, uid, chunksetIndex, inclusionProof, toByteArray(chunksetData), auth);
+
+    result.spAcks.forEach((ack) => aggregatedAcks.set(ack.slot, toByteArray(ack.signature)));
+    uploadedBytes += chunksetData.byteLength;
+    const percent = 66 + Math.min(8, Math.round((uploadedBytes / Math.max(totalBytes, 1)) * 8));
+    reportProgress(context, "uploading", percent, `Uploading ${blobName} to Shelby RPC`);
+  }
+
+  return Array.from(aggregatedAcks.entries()).map(([slot, signature]) => ({ slot, signature }));
+}
+
+async function uploadShelbyChunkset(
+  client: ShelbyClient,
+  context: ShelbyStorageContext,
+  accountAddress: string,
+  uid: bigint,
+  chunksetIndex: number,
+  inclusionProof: string,
+  chunksetData: Uint8Array,
+  auth: ShelbyChallengeSignature,
+): Promise<{ spAcks: StorageProviderAck[] }> {
+  const requestInit: RequestInit = {
+    method: "PUT",
+    headers: createShelbyChunksetHeaders(context, auth, inclusionProof),
+    body: toArrayBuffer(chunksetData),
+  };
+  if (context.abortSignal) {
+    requestInit.signal = context.abortSignal;
+  }
+
+  const response = await fetch(createChunksetUploadUrl(client.rpc.baseUrl, accountAddress, chunksetIndex, uid), requestInit);
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new ShelbyStorageError("NETWORK_ERROR", `Shelby RPC chunkset upload failed with HTTP ${response.status}${body ? `: ${body}` : ""}`);
+  }
+
+  const json = await response.json() as { spAcks?: Array<{ slot: number; signature: string }> };
+  return {
+    spAcks: (json.spAcks ?? []).map((ack) => ({
+      slot: ack.slot,
+      signature: base64Decode(ack.signature),
+    })),
+  };
+}
+
+async function commitShelbyObject(
+  client: ShelbyClient,
+  context: ShelbyStorageContext,
+  uid: bigint,
+  blobName: string,
+  storageProviderAcks: StorageProviderAck[],
+): Promise<void> {
+  const signAndSubmitTransaction = requireSignAndSubmitTransaction(context);
+  const payload = ShelbyBlobClient.createCommitObjectPayload({
+    deployer: client.coordination.deployer,
+    uid,
+    blobName,
+    overwrite: true,
+    storageProviderAcks,
+  });
+
+  const submitted = await signAndSubmitTransaction({ data: payload });
+  const confirmedCommit = await (context.aptos ?? createAptosClient(context)).waitForTransaction({
+    transactionHash: submitted.hash,
+  });
+  const events = (confirmedCommit as ConfirmedTransactionWithEvents).events ?? [];
+  const rejection = ShelbyBlobClient.findObjectCommitRejection(events, client.coordination.deployer, uid);
+  if (rejection) {
+    throw new ShelbyStorageError("UPLOAD_FAILED", `Shelby object commit was rejected: ${rejection}`);
+  }
+}
+
+function createChunksetUploadUrl(baseUrl: string, accountAddress: string, chunksetIndex: number, uid: bigint): string {
+  return `${stripTrailingSlash(baseUrl)}/v2/chunksets/${encodeURIComponent(accountAddress)}/${chunksetIndex}/${uid.toString()}`;
+}
+
+function createShelbyChunksetHeaders(
+  context: ShelbyStorageContext,
+  auth: ShelbyChallengeSignature,
+  inclusionProof: string,
+): HeadersInit {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/octet-stream",
+    "X-Shelby-Challenge": auth.challenge,
+    "X-Shelby-Signature": base64Encode(auth.signature),
+    "X-Shelby-Public-Key": Hex.fromHexInput(auth.publicKey).toString(),
+    "X-Shelby-Inclusion-Proof": inclusionProof,
+  };
+
+  const apiKey = context.apiKey ?? import.meta.env.VITE_SHELBY_API_KEY;
+  if (apiKey) {
+    headers.Authorization = `Bearer ${apiKey}`;
+  }
+
+  return headers;
+}
+
+async function generateChunksetInclusionProof(chunksetRoots: Hex[], chunksetIndex: number): Promise<Uint8Array[]> {
+  if (chunksetRoots.length === 0) {
+    throw new ShelbyStorageError("UPLOAD_FAILED", "Cannot generate Shelby inclusion proof without chunkset roots");
+  }
+  if (chunksetIndex < 0 || chunksetIndex >= chunksetRoots.length) {
+    throw new ShelbyStorageError("UPLOAD_FAILED", `Shelby chunkset index ${chunksetIndex} is out of range`);
+  }
+  if (chunksetRoots.length === 1) {
+    return [];
+  }
+
+  const zeroHash = new Uint8Array(new ArrayBuffer(32));
+  const siblings: Uint8Array[] = [];
+  let currentLeaves = chunksetRoots.map((root) => root.toUint8Array());
+  let currentIndex = chunksetIndex;
+
+  while (currentLeaves.length > 1) {
+    if (currentLeaves.length % 2 !== 0) {
+      currentLeaves.push(zeroHash);
+    }
+
+    const siblingIndex = currentIndex % 2 === 0 ? currentIndex + 1 : currentIndex - 1;
+    const sibling = currentLeaves[siblingIndex];
+    if (sibling) {
+      siblings.push(sibling);
+    }
+
+    const nextLeaves: Uint8Array[] = [];
+    for (let index = 0; index < currentLeaves.length; index += 2) {
+      const left = currentLeaves[index];
+      const right = currentLeaves[index + 1];
+      if (left && right) {
+        nextLeaves.push(await hashConcat(left, right));
+      }
+    }
+
+    currentLeaves = nextLeaves;
+    currentIndex = Math.floor(currentIndex / 2);
+  }
+
+  return siblings;
+}
+
+async function hashConcat(left: Uint8Array, right: Uint8Array): Promise<Uint8Array> {
+  const combined = new Uint8Array(new ArrayBuffer(left.byteLength + right.byteLength));
+  combined.set(left, 0);
+  combined.set(right, left.byteLength);
+  return new Uint8Array(await crypto.subtle.digest("SHA-256", combined));
+}
+function encodeInclusionProof(siblings: Uint8Array[]): string {
+  if (siblings.length === 0) {
+    return "NONE";
+  }
+
+  const totalBytes = siblings.length * 32;
+  const combined = new Uint8Array(new ArrayBuffer(totalBytes));
+  let offset = 0;
+  for (const sibling of siblings) {
+    combined.set(sibling, offset);
+    offset += 32;
+  }
+  return base64Encode(combined);
+}
 async function generateBlobCommitments(blobData: ByteArray): Promise<BlobCommitments> {
   try {
     const provider = await createDefaultErasureCodingProvider();
@@ -582,6 +820,13 @@ function requireSignAndSubmitTransaction(context: ShelbyStorageContext): SignAnd
   return context.signAndSubmitTransaction;
 }
 
+function requireSignShelbyChallenge(context: ShelbyStorageContext): SignShelbyChallenge {
+  if (!context.signShelbyChallenge) {
+    throw new ShelbyStorageError("CONFIGURATION_ERROR", "A wallet message signer is required for Shelby RPC upload authorization");
+  }
+  return context.signShelbyChallenge;
+}
+
 function getFetchContext(): ShelbyFetchContext {
   const context: ShelbyFetchContext = {};
   const apiKey = storageContext?.apiKey ?? import.meta.env.VITE_SHELBY_API_KEY;
@@ -617,6 +862,15 @@ function resolveShelbyNetwork(): ShelbyNetwork {
   return Network.TESTNET;
 }
 
+function resolveShelbyWriteLocation(context: ShelbyStorageContext): string | undefined {
+  const configuredLocation = import.meta.env.VITE_SHELBY_WRITE_LOCATION?.trim();
+  if (configuredLocation) {
+    return configuredLocation;
+  }
+
+  const network = context.network ?? resolveShelbyNetwork();
+  return network === Network.SHELBYNET ? "shelbynet-1" : undefined;
+}
 function reportProgress(
   context: ShelbyStorageContext,
   stage: UploadProgress["stage"],
@@ -670,8 +924,50 @@ function createShelbyRpcUploadError(error: unknown): ShelbyStorageError {
   const status = getHttpStatus(error);
   const detail = getNestedErrorMessage(error);
   const reason = status ? `Shelby RPC returned HTTP ${status}` : "Shelby RPC rejected the encrypted blob upload";
-  const message = detail && !detail.includes(reason) ? `${reason}: ${detail}` : reason;
+  const shelbyHint = describeShelbyUploadGuidance(detail);
+  const apiKeyHint = shouldShowShelbyApiKeyHint(status)
+    ? " VITE_SHELBY_API_KEY is not configured; set it if the active Shelby RPC requires authenticated uploads."
+    : "";
+  const message = detail && !detail.includes(reason) ? `${reason}: ${detail}${shelbyHint}${apiKeyHint}` : `${reason}${shelbyHint}${apiKeyHint}`;
   return new ShelbyStorageError(status && status >= 500 ? "NETWORK_ERROR" : "UPLOAD_FAILED", message, error);
+}
+
+function createShelbyRegistrationError(error: unknown): ShelbyStorageError {
+  const detail = getNestedErrorMessage(error);
+  const shelbyHint = describeShelbyUploadGuidance(detail);
+  const message = detail
+    ? `Shelby blob registration failed before wallet signature: ${detail}${shelbyHint}`
+    : "Shelby blob registration failed before wallet signature";
+  return new ShelbyStorageError("UPLOAD_FAILED", message, error);
+}
+
+function describeShelbyUploadGuidance(detail: string | null): string {
+  const normalized = detail?.toLowerCase() ?? "";
+
+  if (
+    normalized.includes("no write location") ||
+    normalized.includes("default location") ||
+    normalized.includes("location hint")
+  ) {
+    return " Configure a Shelby write location for this wallet before browser upload; CLI validation used `shelbynet-1`.";
+  }
+
+  if (
+    normalized.includes("shelbyusd") ||
+    normalized.includes("insufficient shelby") ||
+    normalized.includes("insufficient balance")
+  ) {
+    return " Fund this wallet with ShelbyUSD before uploading to Shelbinet.";
+  }
+
+  return "";
+}
+
+function shouldShowShelbyApiKeyHint(status: number | null): boolean {
+  if (import.meta.env.VITE_SHELBY_API_KEY?.trim()) {
+    return false;
+  }
+  return status === 401 || status === 403 || status === null || (status >= 500 && status <= 599);
 }
 
 function isNonRetryableError(error: unknown): boolean {
@@ -790,6 +1086,23 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
 
     signal?.addEventListener("abort", handleAbort, { once: true });
   });
+}
+
+function base64Encode(bytes: Uint8Array): string {
+  let binary = "";
+  bytes.forEach((byte) => {
+    binary += String.fromCharCode(byte);
+  });
+  return window.btoa(binary);
+}
+
+function base64Decode(value: string): ByteArray {
+  const binary = window.atob(value);
+  const bytes = new Uint8Array(new ArrayBuffer(binary.length));
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
 }
 
 function base64UrlEncode(bytes: Uint8Array): string {

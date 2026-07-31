@@ -8,6 +8,7 @@ import {
   getMetadata,
   type DatasetMetadata,
   ShelbyStorageError,
+  type ShelbyChallengeSignature,
   type SignAndSubmitTransaction,
   type UploadProgress,
   uploadFile,
@@ -62,6 +63,7 @@ export function useUpload(): UseUploadResult {
       configureShelbyStorage({
         accountAddress,
         signAndSubmitTransaction: wallet.signAndSubmitTransaction as SignAndSubmitTransaction,
+        signShelbyChallenge: async (challenge: string) => signShelbyChallenge(wallet, challenge),
         buyerPublicKey,
         abortSignal: currentAbortController.signal,
         onProgress: setProgress,
@@ -154,4 +156,95 @@ export function useShelby(storageId: string | null = null) {
 
 function createHookError(code: ShelbyStorageError["code"], message: string): ShelbyStorageError {
   return new ShelbyStorageError(code, message);
+}
+type WalletForShelbyChallenge = ReturnType<typeof useWallet>;
+
+async function signShelbyChallenge(
+  wallet: WalletForShelbyChallenge,
+  challenge: string,
+): Promise<ShelbyChallengeSignature> {
+  const response = await wallet.signMessage({
+    message: challenge,
+    nonce: crypto.randomUUID(),
+  });
+
+  return {
+    challenge,
+    signature: readBytesFromUnknown(response.signature, "Shelby challenge signature"),
+    publicKey: readBytesFromUnknown(readPublicKey(wallet.account), "wallet public key"),
+  };
+}
+
+function readPublicKey(account: unknown): unknown {
+  if (typeof account !== "object" || account === null) {
+    return null;
+  }
+  return (account as { publicKey?: unknown }).publicKey;
+}
+
+function readBytesFromUnknown(value: unknown, label: string): Uint8Array<ArrayBuffer> {
+  if (value instanceof Uint8Array) {
+    return toByteArray(value);
+  }
+
+  if (typeof value === "string") {
+    return parseByteString(value, label);
+  }
+
+  if (typeof value === "object" && value !== null) {
+    const toUint8Array = (value as { toUint8Array?: unknown }).toUint8Array;
+    if (typeof toUint8Array === "function") {
+      const bytes = toUint8Array.call(value) as unknown;
+      if (bytes instanceof Uint8Array) {
+        return toByteArray(bytes);
+      }
+    }
+
+    const bytes = (value as { bytes?: unknown }).bytes;
+    if (bytes instanceof Uint8Array) {
+      return toByteArray(bytes);
+    }
+
+    const data = (value as { data?: unknown }).data;
+    if (data instanceof Uint8Array) {
+      return toByteArray(data);
+    }
+  }
+
+  throw createHookError("CONFIGURATION_ERROR", `${label} was not returned in a supported byte format`);
+}
+
+function parseByteString(value: string, label: string): Uint8Array<ArrayBuffer> {
+  const normalized = value.trim();
+  if (/^0x[0-9a-fA-F]+$/.test(normalized)) {
+    return hexToBytes(normalized.slice(2));
+  }
+  if (/^[0-9a-fA-F]+$/.test(normalized) && normalized.length % 2 === 0) {
+    return hexToBytes(normalized);
+  }
+
+  try {
+    const binary = window.atob(normalized);
+    const bytes = new Uint8Array(new ArrayBuffer(binary.length));
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index);
+    }
+    return bytes;
+  } catch {
+    throw createHookError("CONFIGURATION_ERROR", `${label} is not valid hex or base64`);
+  }
+}
+
+function hexToBytes(hex: string): Uint8Array<ArrayBuffer> {
+  const bytes = new Uint8Array(new ArrayBuffer(hex.length / 2));
+  for (let index = 0; index < bytes.length; index += 1) {
+    bytes[index] = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
+  }
+  return bytes;
+}
+
+function toByteArray(bytes: Uint8Array): Uint8Array<ArrayBuffer> {
+  const copy = new Uint8Array(new ArrayBuffer(bytes.byteLength));
+  copy.set(bytes);
+  return copy;
 }

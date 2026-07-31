@@ -1,9 +1,10 @@
 import { forwardRef, useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion, type Variants } from "framer-motion";
-import { ChevronDown, Database, Search } from "lucide-react";
+import { AlertTriangle, ChevronDown, Database, Search } from "lucide-react";
 import { clsx } from "clsx";
 import { useMarketplace } from "../hooks/useMarketplace";
 import type { MarketplaceFilters } from "../lib/marketplace";
+import { getRuntimeReadiness, type RuntimeReadiness } from "../lib/readiness";
 import { Button } from "../components/ui/Button";
 import { ErrorState } from "../components/ui/ErrorState";
 import { DatasetCard, DatasetCardSkeleton } from "../components/datasets/DatasetCard";
@@ -87,6 +88,7 @@ export function Marketplace() {
   const filterBarRef = useRef<HTMLDivElement>(null);
   const loadMoreTimeoutRef = useRef<number | null>(null);
   const listings = useMarketplace(filters);
+  const readiness = useMemo(() => getRuntimeReadiness(), []);
 
   const allListings = listings.data ?? [];
   const visibleListings = useMemo(() => allListings.slice(0, visibleCount), [allListings, visibleCount]);
@@ -414,4 +416,30 @@ function MarketplaceSkeletonGrid() {
 
 function activeOptionLabel<T extends string>(options: FilterOption<T>[], value: T): string {
   return options.find((option) => option.value === value)?.label ?? value;
+}
+
+function MarketplaceSetupState({ readiness }: { readiness: RuntimeReadiness }) {
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 12, scale: 0.96 }}
+      animate={{ opacity: 1, y: 0, scale: 1 }}
+      transition={{ duration: 0.4, ease: motionEase }}
+      className="flex flex-col items-center gap-4 px-10 py-[120px] text-center"
+    >
+      <div className="mb-2 flex h-14 w-14 items-center justify-center rounded-[var(--r-xl)] border border-[rgba(245,158,11,0.22)] bg-[var(--warning-soft)] text-warning">
+        <AlertTriangle className="h-6 w-6" aria-hidden="true" />
+      </div>
+      <div className="grid max-w-[44ch] gap-2">
+        <h2 className="font-display text-[22px] font-normal tracking-[-0.025em] text-t1">Stash contract is not connected</h2>
+        <p className="font-body text-[14px] font-light leading-[1.6] text-t2">
+          Deploy the Move package to {readiness.networkName}, then set <span className="font-mono text-t1">VITE_STASH_MODULE_ADDRESS</span> before marketplace data can be indexed.
+        </p>
+      </div>
+      <div className="rounded-xl border border-[var(--border)] bg-raised px-4 py-3 text-left font-mono text-[11px] leading-relaxed text-t3">
+        <p>Network: {readiness.networkName}</p>
+        <p>Indexer: {readiness.aptosIndexerUrl}</p>
+        <p>Module: {readiness.marketplaceModuleAddress ?? "missing"}</p>
+      </div>
+    </motion.div>
+  );
 }
